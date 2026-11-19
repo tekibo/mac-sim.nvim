@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# mac-sim-inject: Sub-second live hot-reload injector for iOS Simulator
+# Part of tekibo/mac-sim.nvim
+
+set -euo pipefail
+
+ROOT="${1:-.}"
+NAME="${2:-}"
+TRIPLE="${3:-x86_64-apple-ios-simulator}"
+CHANGED_FILE="${4:-}"
+SSH_HOST="${MACBOX_SSH_HOST:-macbox}"
+
+cd "$ROOT"
+
+if [ -z "$NAME" ]; then
+    NAME=$(basename "$ROOT")
+    if [ -f "$ROOT/Package.swift" ]; then
+        parsed_name=$(grep -E '^\s*name:\s*"[^"]+"' "$ROOT/Package.swift" | head -n 1 | sed -E 's/.*name:\s*"([^"]+)".*/\1/')
+        [ -n "$parsed_name" ] && NAME="$parsed_name"
+    fi
+fi
+
+# SSH multiplexing for sub-50ms roundtrip transfers
+SSH_MUX="/tmp/mac_sim_ssh_mux"
+SSH_OPTS=(-o "ControlMaster=auto" -o "ControlPath=$SSH_MUX" -o "ControlPersist=10m" -o "ConnectTimeout=2")
+
+COMPILE_SCRIPT="$ROOT/.build/mac_sim_compile.sh"
+JOBS_FILE="$ROOT/.build/mac_sim_jobs.json"
+
+# Ensure compile script and single-file job mapping exist
+python3 -c "
+import os, struct, shlex, json
+
+proj_root = '$ROOT'
+compile_script = '$COMPILE_SCRIPT'
+jobs_file = '$JOBS_FILE'
+changed_file = '$CHANGED_FILE'
+
+def regenerate_jobs():
+    xcbuild_dir = os.path.join(proj_root, '.build/out/Intermediates.noindex/XCBuildData')
+    if not os.path.isdir(xcbuild_dir):
+        return False
+    entries = [e for e in os.listdir(xcbuild_dir) if e.endswith('.xcbuilddata')]
+    entries.sort(key=lambda e: os.path.getmtime(os.path.join(xcbuild_dir, e)), reverse=True)
+    for entry in entries:
+        ts_path = os.path.join(xcbuild_dir, entry, 'task-store.msgpack')
+        if not os.path.exists(ts_path):
+            continue
+        with open(ts_path, 'rb') as f:
+            data = f.read()
+        idx = data.find(b'builtin-SwiftDriver')
+        if idx == -1:
+            continue
+        pos = idx + len(b'builtin-SwiftDriver')
+        items = []
+        def read_item(p):
+            if p >= len(data): return None, p
+            b = data[p]
+            if 0xa0 <= b <= 0xbf:
+                n = b & 0x1f
+                return data[p+1:p+1+n].decode('utf-8', errors='ignore'), p+1+n
+            elif b == 0xd9:
+                n = data[p+1]
+                return data[p+2:p+2+n].decode('utf-8', errors='ignore'), p+2+n
+            elif b == 0xda:
+                n = struct.unpack('>H', data[p+1:p+3])[0]
+                return data[p+3:p+3+n].decode('utf-8', errors='ignore'), p+3+n
+            elif b == 0xdb:
+                n = struct.unpack('>I', data[p+1:p+5])[0]
+                return data[p+5:p+5+n].decode('utf-8', errors='ignore'), p+5+n
+            else:
+                return None, p+1
+        while pos < idx + 6000:
+            val, npos = read_item(pos)
+            if val is not None:
+                items.append(val)
+                pos = npos
+            else:
+                pos = npos
+        cmd = []
+        for it in items[1:]:
+            if it in ('SwiftDriver', 'builtin-SwiftDriver', 'normal', 'x86_64') and len(cmd) > 10:
+                break
+            cmd.append(it)
+        if cmd:
+            import subprocess
+            driver_cmd = cmd + ['-driver-print-jobs']
+            res = subprocess.run(driver_cmd, cwd=proj_root, capture_output=True, text=True)
+            prefix = cmd[0].replace('swiftc', 'swift-frontend')
+            raw_jobs = res.stdout.split(prefix)
+            jobs_map = {}
+            for rj in raw_jobs[1:]:
+                j_args = shlex.split(prefix + rj)
+                primary = None
+                for i, a in enumerate(j_args):
+                    if a == '-primary-file' and i + 1 < len(j_args):
+                        primary = j_args[i+1]
+                        break
+                if primary:
+                    jobs_map[primary] = j_args
+            if jobs_map:
+                os.makedirs(os.path.dirname(compile_script), exist_ok=True)
+                with open(compile_script, 'w') as out_f:
+                    out_f.write('#!/bin/sh\nexec ' + ' '.join(shlex.quote(c) for c in cmd) + ' \"\$@\"\n')
+                os.chmod(compile_script, 0o755)
+                with open(jobs_file, 'w') as out_f:
+                    json.dump(jobs_map, out_f, indent=2)
+                return True
+    return False
+
+# Regenerate if jobs file missing or if changed_file is not in it
+needs_regen = not os.path.exists(jobs_file)
+if not needs_regen and changed_file:
+    try:
+        with open(jobs_file) as f:
+            jobs = json.load(f)
+            if changed_file not in jobs:
+                needs_regen = True
+    except Exception:
+        needs_regen = True
+
+if needs_regen:
+    regenerate_jobs()
+" 2>/dev/null || true
+
+# 1. Ultra-fast single-file compilation (< 150ms)
+COMPILED_OK=0
+if [ -n "$CHANGED_FILE" ] && [ -f "$JOBS_FILE" ]; then
+    RET=0
+    COMPILE_ERR=$(python3 -c "
+import json, subprocess, sys
+proj_root = '$ROOT'
+file_path = '$CHANGED_FILE'
+with open('$JOBS_FILE') as f:
+    jobs = json.load(f)
+args = jobs.get(file_path)
+if args:
+    res = subprocess.run(args, cwd=proj_root, capture_output=True, text=True)
+    if res.returncode != 0:
+        err = res.stderr or res.stdout
+        lines = [line for line in err.splitlines() if line.strip()]
+        sys.stderr.write('\n'.join(lines[:5]) + '\n')
+    sys.exit(res.returncode)
+sys.exit(2)
+" 2>&1) || RET=$?
+    if [ "$RET" -eq 0 ]; then
+        COMPILED_OK=1
+    elif [ "$RET" -eq 1 ]; then
+        echo "$COMPILE_ERR" >&2
+        exit 1
+    fi
+fi
+
+# If file was not in jobs map (brand new file), build once to register
+if [ "$COMPILED_OK" -eq 0 ]; then
+    if command -v idev >/dev/null 2>&1; then
+        idev xtool dev build --triple "$TRIPLE" >/dev/null 2>&1 || exit 1
+    else
+        xtool dev build --triple "$TRIPLE" >/dev/null 2>&1 || exit 1
+    fi
+fi
+
+# 2. Collect object files directly from build intermediates
+INTERMEDIATES_DIR="$ROOT/.build/out/Intermediates.noindex/$NAME.build/Debug-iphonesimulator/$NAME-t.build/Objects-normal/x86_64"
+OBJ_FILES=()
+
+if [ -d "$INTERMEDIATES_DIR" ]; then
+    for obj in "$INTERMEDIATES_DIR"/*.o; do
+        [ -f "$obj" ] || continue
+        case "$(basename "$obj")" in
+            *App.o|main.o|stub.o) ;;
+            *) OBJ_FILES+=("$obj") ;;
+        esac
+    done
+fi
+
+WORK_DIR=""
+if [ ${#OBJ_FILES[@]} -eq 0 ]; then
+    ARCHIVE=""
+    for cand in "$ROOT/.build/debug/$NAME.o" \
+                "$ROOT/.build/out/Products/Debug-iphonesimulator/$NAME.o" \
+                "$ROOT/xtool/.build/debug/$NAME.o"; do
+        if [ -f "$cand" ]; then
+            ARCHIVE="$cand"
+            break
+        fi
+    done
+
+    if [ -z "$ARCHIVE" ]; then
+        echo "[mac-sim-inject] Error: Could not locate compiled archive for $NAME" >&2
+        exit 1
+    fi
+
+    COUNTER_FILE="/tmp/mac_sim_inject_counter"
+    COUNT=1
+    if [ -f "$COUNTER_FILE" ]; then
+        COUNT=$(($(cat "$COUNTER_FILE" 2>/dev/null || echo 0) + 1))
+    fi
+    echo "$COUNT" > "$COUNTER_FILE"
+
+    WORK_DIR="/tmp/mac-sim-inject-$$-${COUNT}"
+    mkdir -p "$WORK_DIR"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+
+    cd "$WORK_DIR"
+    ar x "$ARCHIVE"
+    for obj in *.o; do
+        [ -f "$obj" ] || continue
+        case "$obj" in
+            *App.o|main.o|stub.o) ;;
+            *) OBJ_FILES+=("$WORK_DIR/$obj") ;;
+        esac
+    done
+    [ ${#OBJ_FILES[@]} -gt 0 ] || OBJ_FILES=("$WORK_DIR"/*.o)
+fi
+
+COUNTER_FILE="/tmp/mac_sim_inject_counter"
+COUNT=1
+if [ -f "$COUNTER_FILE" ]; then
+    COUNT=$(($(cat "$COUNTER_FILE" 2>/dev/null || echo 0) + 1))
+fi
+echo "$COUNT" > "$COUNTER_FILE"
+
+DYLIB_NAME="eval_injection_${COUNT}.dylib"
+LOCAL_DYLIB="/tmp/$DYLIB_NAME"
+REMOTE_DYLIB="/tmp/$DYLIB_NAME"
+
+SDK_PATH=""
+for cand_sdk in \
+    "/home/upperstange/.local/share/idev/.config/swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk" \
+    "$HOME/.local/share/idev/.config/swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk" \
+    "$HOME/.local/share/idev/.config/swiftpm/swift-sdks/darwin.artifactbundle/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs"/*iPhoneSimulator*.sdk; do
+    if [ -d "$cand_sdk" ]; then
+        SDK_PATH="$cand_sdk"
+        break
+    fi
+done
+
+LD="ld64.lld"
+if command -v ld64.lld >/dev/null 2>&1; then
+    LD="ld64.lld"
+elif [ -x "$HOME/.local/share/idev/toolchains/swift-6.4.2/usr/bin/ld64.lld" ]; then
+    LD="$HOME/.local/share/idev/toolchains/swift-6.4.2/usr/bin/ld64.lld"
+fi
+
+"$LD" \
+    -arch x86_64 -dylib \
+    ${SDK_PATH:+-syslibroot "$SDK_PATH"} \
+    -platform_version ios-simulator 17.0 17.0 \
+    -undefined dynamic_lookup \
+    -o "$LOCAL_DYLIB" \
+    "${OBJ_FILES[@]}"
+
+# 3. Fast transfer to Macbox with multiplexed connection
+scp "${SSH_OPTS[@]}" -q "$LOCAL_DYLIB" "$SSH_HOST:$REMOTE_DYLIB"
+
+# 4. Trigger in-process reload via bridge control socket
+RES=$(ssh "${SSH_OPTS[@]}" "$SSH_HOST" "echo '$REMOTE_DYLIB' | nc -U /tmp/hotreload_control.sock 2>/dev/null || echo 'FAIL'")
+if [[ "$RES" != *"OK"* ]]; then
+    # Auto-heal: Try starting bridge daemon on Macbox if not running
+    ssh "${SSH_OPTS[@]}" "$SSH_HOST" "if [ -f ~/.mac-sim/bin/mac-sim-bridge ]; then nohup /usr/bin/python3 -u ~/.mac-sim/bin/mac-sim-bridge > /tmp/injection_bridge.log 2>&1 & elif [ -f /tmp/injection_bridge.py ]; then nohup /usr/bin/python3 -u /tmp/injection_bridge.py > /tmp/injection_bridge.log 2>&1 & fi" >/dev/null 2>&1 || true
+    sleep 0.6
+    RES=$(ssh "${SSH_OPTS[@]}" "$SSH_HOST" "echo '$REMOTE_DYLIB' | nc -U /tmp/hotreload_control.sock 2>/dev/null || echo 'FAIL'")
+fi
+
+if [[ "$RES" == *"OK"* ]]; then
+    echo "OK"
+    exit 0
+else
+    echo "[mac-sim-inject] Bridge response: $RES" >&2
+    exit 1
+fi

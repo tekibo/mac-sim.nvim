@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+mac-sim-bridge: Hot-reload bridge daemon for iOS Simulator
+Part of tekibo/mac-sim.nvim
+
+Runs on Macbox. Bridges InjectionClient (TCP 8887) inside the running
+iOS Simulator app with a local Unix domain socket (/tmp/hotreload_control.sock).
+Allows sub-second dynamic dylib injection without killing the app.
+"""
+
+import atexit
+import os
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+
+SOCK_PATH = "/tmp/hotreload_control.sock"
+PID_FILE = "/tmp/mac-sim-bridge.pid"
+
+def cleanup():
+    if os.path.exists(SOCK_PATH):
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+    if os.path.exists(PID_FILE):
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+
+atexit.register(cleanup)
+
+def read_int(sock):
+    data = b""
+    while len(data) < 4:
+        c = sock.recv(4 - len(data))
+        if not c:
+            return None
+        data += c
+    return struct.unpack("<i", data)[0]
+
+def read_string(sock):
+    length = read_int(sock)
+    if length is None or length <= 0:
+        return ""
+    buf = b""
+    while len(buf) < length:
+        chunk = sock.recv(min(4096, length - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("utf-8", errors="replace")
+
+def write_int(sock, val):
+    sock.sendall(struct.pack("<i", val))
+
+def write_string(sock, s):
+    encoded = s.encode("utf-8")
+    write_int(sock, len(encoded))
+    sock.sendall(encoded)
+
+def write_command(sock, cmd, s):
+    write_int(sock, cmd)
+    write_string(sock, s)
+
+current_client = None
+client_lock = threading.Lock()
+
+def client_worker(sock, addr):
+    global current_client
+    print(f"[Bridge] Client connected from {addr}", flush=True)
+    try:
+        version = read_int(sock)
+        key = read_string(sock)
+        print(f"[Bridge] Handshake version={version}, key={key}", flush=True)
+        with client_lock:
+            current_client = sock
+        while True:
+            resp_cmd = read_int(sock)
+            if resp_cmd is None:
+                break
+            resp_str = read_string(sock)
+            print(f"[Bridge] App response: cmd={resp_cmd}, str={resp_str}", flush=True)
+    except Exception as e:
+        print(f"[Bridge] Exception: {e}", flush=True)
+    finally:
+        with client_lock:
+            if current_client == sock:
+                current_client = None
+        sock.close()
+        print("[Bridge] Client disconnected", flush=True)
+
+def control_server():
+    if os.path.exists(SOCK_PATH):
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+    ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    ctl.bind(SOCK_PATH)
+    ctl.listen(5)
+    print(f"[Bridge] Control socket listening at {SOCK_PATH}", flush=True)
+    while True:
+        conn, _ = ctl.accept()
+        data = conn.recv(1024).decode("utf-8").strip()
+        if data:
+            print(f"[Bridge] Control received inject command for: {data}", flush=True)
+            with client_lock:
+                if current_client:
+                    try:
+                        # Command 1 is InjectionLoad
+                        write_command(current_client, 1, data)
+                        conn.sendall(b"OK\n")
+                    except Exception as ex:
+                        conn.sendall(f"ERROR: {ex}\n".encode("utf-8"))
+                else:
+                    conn.sendall(b"ERROR: No client connected\n")
+        conn.close()
+
+def main():
+    # 1. First bind TCP server
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", 8887))
+    except OSError as e:
+        print(f"[Bridge] TCP port 8887 bind failed: {e}", flush=True)
+        sys.exit(1)
+    srv.listen(5)
+    print("[Bridge] Injection listener on 127.0.0.1:8887", flush=True)
+
+    # 2. Write PID file
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    # 3. Start control server
+    threading.Thread(target=control_server, daemon=True).start()
+
+    while True:
+        sock, addr = srv.accept()
+        t = threading.Thread(target=client_worker, args=(sock, addr), daemon=True)
+        t.start()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# mac-sim-preview: Isolated Xcode-style SwiftUI canvas preview via axe and Kitty graphics
+# Part of tekibo/mac-sim.nvim
+set -euo pipefail
+
+IS_DAEMON=0
+if [ "${1:-}" = "--daemon" ]; then
+  IS_DAEMON=1
+  shift
+fi
+
+SOURCE_FILE="${1:-}"
+if [ -z "$SOURCE_FILE" ] || [ ! -f "$SOURCE_FILE" ]; then
+  echo "Usage: mac-sim-preview [--daemon] <path/to/View.swift> [output.png]" >&2
+  exit 1
+fi
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/mac-sim.nvim"
+mkdir -p "$RUNTIME_DIR"
+DEST_PNG="${2:-$RUNTIME_DIR/preview.png}"
+mkdir -p "$(dirname "$DEST_PNG")"
+
+HOST="${MAC_SIM_HOST:-macbox}"
+SSH_OPTS="-o ControlMaster=auto -o ControlPath=$RUNTIME_DIR/ssh_mux -o ControlPersist=10m -o ConnectTimeout=3"
+
+# Resolve simulator UDID
+DEV_SPEC="${MAC_SIM_DEVICE:-}"
+UDID=""
+
+if [[ "$DEV_SPEC" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+  UDID="$DEV_SPEC"
+elif command -v mac-sim >/dev/null 2>&1; then
+  if [ -n "$DEV_SPEC" ]; then
+    UDID=$(MAC_SIM_DEVICE="$DEV_SPEC" mac-sim udid 2>/dev/null || true)
+  else
+    UDID=$(mac-sim udid 2>/dev/null || true)
+  fi
+fi
+
+if [ -z "$UDID" ] && [ -n "$DEV_SPEC" ]; then
+  UDID=$(ssh $SSH_OPTS "$HOST" "xcrun simctl list devices | grep -i '$DEV_SPEC' | grep '(Booted)' | grep -oE '[0-9A-Fa-f-]{36}' | head -n1" || true)
+  if [ -z "$UDID" ]; then
+    echo "Error: Specified device '$DEV_SPEC' is not booted on $HOST." >&2
+    exit 1
+  fi
+fi
+
+if [ -z "$UDID" ]; then
+  UDID=$(ssh $SSH_OPTS "$HOST" "xcrun simctl list devices | grep '(Booted)' | grep -oE '[0-9A-Fa-f-]{36}' | head -n1" || true)
+fi
+
+if [ -z "$UDID" ]; then
+  echo "Error: No booted simulator found. Boot one with 'mac-sim up' or pass MAC_SIM_DEVICE." >&2
+  exit 1
+fi
+
+# Locate module root and name from Package.swift
+ABS_SOURCE=$(realpath "$SOURCE_FILE")
+DIR=$(dirname "$ABS_SOURCE")
+MODULE_ROOT=""
+MODULE_NAME="Healthbox"
+while [ "$DIR" != "/" ]; do
+  if [ -f "$DIR/Package.swift" ]; then
+    MODULE_ROOT="$DIR"
+    NAME_MATCH=$(grep -m1 'name:[[:space:]]*"[^"]*"' "$DIR/Package.swift" | sed -E 's/.*name:[[:space:]]*"([^"]+)".*/\1/' || true)
+    if [ -n "$NAME_MATCH" ]; then
+      MODULE_NAME="$NAME_MATCH"
+    fi
+    break
+  fi
+  DIR=$(dirname "$DIR")
+done
+
+if [ -z "$MODULE_ROOT" ]; then
+  MODULE_ROOT=$(dirname "$ABS_SOURCE")
+fi
+
+# Find all Swift source files in module
+SOURCES_DIR="$MODULE_ROOT/Sources/$MODULE_NAME"
+if [ ! -d "$SOURCES_DIR" ]; then
+  SOURCES_DIR=$(dirname "$ABS_SOURCE")
+fi
+
+# Resolve minimum iOS version from Package.swift (fallback to 18.0)
+TARGET_IOS_VERSION="18.0"
+if [ -f "$MODULE_ROOT/Package.swift" ]; then
+  VER=$(grep -E '\.iOS\(' "$MODULE_ROOT/Package.swift" | sed -E 's/.*\.iOS\(([^)]+)\).*/\1/' | tr -d ' "' | sed -E 's/^\.v//' || true)
+  if [[ "$VER" =~ ^[0-9]+$ ]]; then
+    TARGET_IOS_VERSION="${VER}.0"
+  elif [[ "$VER" =~ ^[0-9]+\.[0-9]+ ]]; then
+    TARGET_IOS_VERSION="$VER"
+  fi
+fi
+SWIFT_TARGET="x86_64-apple-ios${TARGET_IOS_VERSION}-simulator"
+
+FILE_NAME=$(basename "$ABS_SOURCE")
+REL_SOURCE=$(realpath --relative-to="$SOURCES_DIR" "$ABS_SOURCE" 2>/dev/null || echo "$FILE_NAME")
+LOWER_MODULE=$(echo "$MODULE_NAME" | tr '[:upper:]' '[:lower:]')
+# Remote paths
+REMOTE_CACHE="Library/Caches/mac-sim.nvim"
+REMOTE_SRC="$REMOTE_CACHE/sources"
+REMOTE_MOD="$REMOTE_CACHE/modules"
+REMOTE_BIN=".local/lib/mac-sim.nvim/bin"
+
+# Ensure remote directories exist and rebuild if target changed
+REMOTE_READY=$(ssh $SSH_OPTS "$HOST" "
+  if [ -f ~/$REMOTE_CACHE/${MODULE_NAME}.app/$MODULE_NAME ] && \
+     [ -f ~/$REMOTE_MOD/$MODULE_NAME.swiftmodule ] && \
+     [ -f ~/$REMOTE_CACHE/.target_version ] && \
+     [ \"\$(cat ~/$REMOTE_CACHE/.target_version 2>/dev/null)\" = \"$SWIFT_TARGET\" ]; then
+    echo 1
+  else
+    mkdir -p ~/$REMOTE_SRC ~/$REMOTE_MOD ~/$REMOTE_BIN ~/.local/bin
+    echo 0
+  fi
+")
+
+if [ "$REMOTE_READY" = "1" ]; then
+  REMOTE_COUNT=$(ssh $SSH_OPTS "$HOST" "find ~/$REMOTE_SRC -name '*.swift' ! -name 'Package.swift' 2>/dev/null | wc -l" | tr -d ' ' || echo "0")
+  LOCAL_COUNT=$(cd "$SOURCES_DIR" && find . -name "*.swift" ! -name "Package.swift" | wc -l | tr -d ' ')
+  if [ "$LOCAL_COUNT" != "$REMOTE_COUNT" ]; then
+    REMOTE_READY=0
+  fi
+fi
+
+# If remote host app or swiftmodule is missing (or forced rebuild), compile once
+if [ "$REMOTE_READY" != "1" ] || [ "${MAC_SIM_REBUILD:-0}" = "1" ]; then
+  ssh $SSH_OPTS "$HOST" "rm -rf ~/$REMOTE_SRC && mkdir -p ~/$REMOTE_SRC"
+  (cd "$SOURCES_DIR" && tar -cf - $(find . -name "*.swift")) | ssh $SSH_OPTS "$HOST" "tar -xf - -C ~/$REMOTE_SRC"
+  ssh $SSH_OPTS "$HOST" "
+    # Terminate any running app on simulator and remove stale sockets
+    xcrun simctl terminate \"$UDID\" \"com.tekibo.$LOWER_MODULE\" 2>/dev/null || true
+    setopt nullglob 2>/dev/null || true
+    setopt shwordsplit 2>/dev/null || true
+    rm -f ~/Library/Caches/axe/preview-*/*.sock ~/.cache/axe/preview-*/*.sock 2>/dev/null || true
+
+    rm -f ~/$REMOTE_SRC/Package.swift
+    SWIFT_SOURCES=\$(find ~/$REMOTE_SRC -name \"*.swift\" ! -name \"Package.swift\")
+
+    mkdir -p ~/$REMOTE_CACHE/${MODULE_NAME}.app
+    cat > ~/$REMOTE_CACHE/${MODULE_NAME}.app/Info.plist << 'PLISTEOF'
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.tekibo.${MODULE_NAME}</string>
+    <key>CFBundleExecutable</key>
+    <string>${MODULE_NAME}</string>
+    <key>CFBundleName</key>
+    <string>${MODULE_NAME}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+</dict>
+</plist>
+PLISTEOF
+
+    xcrun swiftc \
+      -sdk \$(xcrun --show-sdk-path --sdk iphonesimulator) \
+      -target $SWIFT_TARGET \
+      -emit-executable \
+      -emit-module \
+      -emit-module-path ~/$REMOTE_MOD/$MODULE_NAME.swiftmodule \
+      -enable-private-imports \
+      -Xfrontend -enable-implicit-dynamic \
+      -module-name $MODULE_NAME \
+      \$SWIFT_SOURCES \
+      -o ~/$REMOTE_CACHE/${MODULE_NAME}.app/$MODULE_NAME \
+      -swift-version 6
+
+    codesign -f -s - ~/$REMOTE_CACHE/${MODULE_NAME}.app >/dev/null 2>&1 || true
+    xcrun simctl install \"$UDID\" ~/$REMOTE_CACHE/${MODULE_NAME}.app >/dev/null 2>&1 || true
+    echo \"$SWIFT_TARGET\" > ~/$REMOTE_CACHE/.target_version
+    rm -f ~/$REMOTE_CACHE/buildinfo.json
+  "
+fi
+
+# Sync target source file to remote
+ssh $SSH_OPTS "$HOST" "mkdir -p ~/$REMOTE_SRC/$(dirname "$REL_SOURCE")"
+scp $SSH_OPTS "$ABS_SOURCE" "$HOST:~/$REMOTE_SRC/$REL_SOURCE" >/dev/null
+
+# If daemon mode requested, execute interactive streaming loop over stdin/stdout
+if [ "$IS_DAEMON" = "1" ]; then
+  exec ssh $SSH_OPTS "$HOST" "
+    REMOTE_HOME=\$(eval echo ~)
+    if [ ! -f ~/$REMOTE_CACHE/buildinfo.json ] || ! grep -q \"$SWIFT_TARGET\" ~/$REMOTE_CACHE/buildinfo.json 2>/dev/null; then
+      SRC_JSON=\$(find ~/$REMOTE_SRC -name \"*.swift\" ! -name \"Package.swift\" 2>/dev/null | awk '{if (NR>1) print \",\"; printf \"    \\\"\" \$0 \"\\\"\"}')
+      cat > ~/$REMOTE_CACHE/buildinfo.json << BINFOEOF
+{
+  \"schemaVersion\": 1,
+  \"module\": \"$MODULE_NAME\",
+  \"configuration\": \"Debug\",
+  \"provider\": \"xtool\",
+  \"swiftcArguments\": [
+    \"-target\", \"$SWIFT_TARGET\",
+    \"-swift-version\", \"6\"
+  ],
+  \"sourceFiles\": [
+\$SRC_JSON
+  ],
+  \"moduleSearchPaths\": [
+    \"\$REMOTE_HOME/$REMOTE_MOD\"
+  ],
+  \"frameworkSearchPaths\": [],
+  \"indexStorePath\": \"\",
+  \"transitiveDependencies\": [],
+  \"appBundlePath\": \"\$REMOTE_HOME/$REMOTE_CACHE/${MODULE_NAME}.app\",
+  \"appBundleId\": \"com.tekibo.$LOWER_MODULE\"
+}
+BINFOEOF
+    fi
+    export PATH=\"\$HOME/.local/bin:\$HOME/.local/lib/mac-sim.nvim/bin:\$PATH\"
+    axe preview ~/$REMOTE_SRC/$REL_SOURCE \
+      --build-info ~/$REMOTE_CACHE/buildinfo.json \
+      --device $UDID \
+      --keep-alive \
+      --daemon
+  "
+fi
+
+# Run axe preview with keep-alive, streaming PNG directly to local destination
+TMP_DEST_PNG="${DEST_PNG}.tmp.$$"
+if ! ssh $SSH_OPTS "$HOST" "
+  REMOTE_HOME=\$(eval echo ~)
+  if [ ! -f ~/$REMOTE_CACHE/buildinfo.json ] || ! grep -q \"$SWIFT_TARGET\" ~/$REMOTE_CACHE/buildinfo.json 2>/dev/null; then
+    SRC_JSON=\$(find ~/$REMOTE_SRC -name \"*.swift\" ! -name \"Package.swift\" 2>/dev/null | awk '{if (NR>1) print \",\"; printf \"    \\\"\" \$0 \"\\\"\"}')
+    cat > ~/$REMOTE_CACHE/buildinfo.json << BINFOEOF
+{
+  \"schemaVersion\": 1,
+  \"module\": \"$MODULE_NAME\",
+  \"configuration\": \"Debug\",
+  \"provider\": \"xtool\",
+  \"swiftcArguments\": [
+    \"-target\", \"$SWIFT_TARGET\",
+    \"-swift-version\", \"6\"
+  ],
+  \"sourceFiles\": [
+\$SRC_JSON
+  ],
+  \"moduleSearchPaths\": [
+    \"\$REMOTE_HOME/$REMOTE_MOD\"
+  ],
+  \"frameworkSearchPaths\": [],
+  \"indexStorePath\": \"\",
+  \"transitiveDependencies\": [],
+  \"appBundlePath\": \"\$REMOTE_HOME/$REMOTE_CACHE/${MODULE_NAME}.app\",
+  \"appBundleId\": \"com.tekibo.$LOWER_MODULE\"
+}
+BINFOEOF
+  fi
+  export PATH=\"\$HOME/.local/bin:\$HOME/.local/lib/mac-sim.nvim/bin:\$PATH\"
+  axe preview ~/$REMOTE_SRC/$REL_SOURCE \
+    --build-info ~/$REMOTE_CACHE/buildinfo.json \
+    --device $UDID \
+    --keep-alive
+" > "$TMP_DEST_PNG"; then
+  rm -f "$TMP_DEST_PNG"
+  exit 1
+fi
+
+if [ -s "$TMP_DEST_PNG" ]; then
+  mv -f "$TMP_DEST_PNG" "$DEST_PNG"
+else
+  rm -f "$TMP_DEST_PNG"
+  echo "Error: Preview output is empty" >&2
+  exit 1
+fi
+
+echo "$DEST_PNG"

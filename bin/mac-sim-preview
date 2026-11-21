@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# mac-sim-preview: prepare a remote axe preview session.
+#
+# It resolves the project, the claimed simulator, and the generated Xcode
+# workspace, syncs the project to macbox, and prints one JSON object describing
+# the remote session. The Neovim client owns the JSON Lines protocol.
+set -euo pipefail
+
+MODE=""
+FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prepare)
+      MODE="prepare"
+      shift
+      ;;
+    --file)
+      FILE="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,8p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "mac-sim-preview: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+[ "$MODE" = "prepare" ] || { echo "mac-sim-preview: --prepare is required" >&2; exit 2; }
+[ -n "$FILE" ] || { echo "mac-sim-preview: --file is required" >&2; exit 2; }
+[ -f "$FILE" ] || { echo "mac-sim-preview: file not found: $FILE" >&2; exit 1; }
+
+abs_file="$(realpath "$FILE")"
+dir="$(dirname "$abs_file")"
+root=""
+while [ "$dir" != "/" ]; do
+  if [ -f "$dir/xtool.yml" ] || [ -f "$dir/Package.swift" ] ||
+     compgen -G "$dir/*.xcworkspace" >/dev/null ||
+     compgen -G "$dir/*.xcodeproj" >/dev/null; then
+    root="$dir"
+    break
+  fi
+  dir="$(dirname "$dir")"
+done
+[ -n "$root" ] || { echo "mac-sim-preview: no Swift/Xcode project above $FILE" >&2; exit 1; }
+
+command -v rsync >/dev/null 2>&1 || {
+  echo "mac-sim-preview: rsync is required to sync the project" >&2
+  exit 1
+}
+
+host="${MAC_SIM_HOST:-macbox}"
+# mac-sim claims are per checkout. Ask from the project root so a Neovim
+# session opened elsewhere still resolves this project's simulator.
+udid="$(cd "$root" && mac-sim udid 2>/dev/null || true)"
+[ -n "$udid" ] || {
+  echo "mac-sim-preview: this checkout has no simulator; run 'mac-sim up'" >&2
+  exit 1
+}
+
+container_rel=""
+container_kind=""
+scheme="${MAC_SIM_SCHEME:-}"
+if [ -f "$root/xtool.yml" ]; then
+  command -v idev >/dev/null 2>&1 || {
+    echo "mac-sim-preview: idev is required for xtool projects" >&2
+    exit 1
+  }
+  [ -f "$root/Package.swift" ] || {
+    echo "mac-sim-preview: xtool.yml present but Package.swift is missing" >&2
+    exit 1
+  }
+  package_name="$(python3 - "$root/Package.swift" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'Package\s*\(\s*name\s*:\s*"([^"]+)"', text, re.S)
+print(m.group(1) if m else "")
+PY
+)"
+  [ -n "$package_name" ] || {
+    echo "mac-sim-preview: cannot read the package name from $root/Package.swift" >&2
+    exit 1
+  }
+  container_rel="xtool/$package_name.xcworkspace"
+  container_kind="workspace"
+  # xtool regenerates both the workspace and the app project. Run it every
+  # time so a stale or partially generated xtool/ directory cannot break the
+  # remote xcodebuild.
+  (cd "$root" && idev swift generate-xcode-project) >&2
+  [ -d "$root/$container_rel" ] || {
+    echo "mac-sim-preview: xtool did not create $container_rel" >&2
+    exit 1
+  }
+  [ -n "$scheme" ] || scheme="$package_name-App"
+else
+  mapfile -t workspaces < <(find "$root" -maxdepth 1 -name '*.xcworkspace' -printf '%f\n')
+  mapfile -t projects < <(find "$root" -maxdepth 1 -name '*.xcodeproj' -printf '%f\n')
+  if [ "${#workspaces[@]}" -gt 1 ] || { [ "${#workspaces[@]}" -eq 0 ] && [ "${#projects[@]}" -gt 1 ]; }; then
+    echo "mac-sim-preview: multiple Xcode containers in $root; remove the extras or set MAC_SIM_SCHEME" >&2
+    exit 1
+  fi
+  if [ "${#workspaces[@]}" -eq 1 ]; then
+    container_rel="${workspaces[0]}"
+    container_kind="workspace"
+  elif [ "${#projects[@]}" -eq 1 ]; then
+    container_rel="${projects[0]}"
+    container_kind="project"
+  else
+    echo "mac-sim-preview: no .xcworkspace or .xcodeproj in $root" >&2
+    exit 1
+  fi
+  [ -n "$scheme" ] || {
+    echo "mac-sim-preview: set MAC_SIM_SCHEME for an Xcode project" >&2
+    exit 1
+  }
+fi
+
+remote_home="$(ssh "$host" 'printf %s "$HOME"')"
+remote_root="$remote_home/Library/Caches/mac-sim.nvim/project"
+remote_axe="$remote_home/.local/bin/axe"
+ssh "$host" "test -x '$remote_axe'" || {
+  echo "mac-sim-preview: axe is not deployed on $host; run :MacSimSetup" >&2
+  exit 1
+}
+
+rel_file="$(python3 - "$abs_file" "$root" <<'PY'
+import os, sys
+print(os.path.relpath(sys.argv[1], sys.argv[2]))
+PY
+)"
+case "$rel_file" in
+  ../*|..) echo "mac-sim-preview: $FILE is outside the project root $root" >&2; exit 1 ;;
+esac
+remote_file="$remote_root/$rel_file"
+
+ssh "$host" "mkdir -p '$remote_root'"
+rsync -a --delete \
+  --exclude '.git/' --exclude '.build/' --exclude 'DerivedData/' \
+  --exclude '*.ipa' --exclude 'xtool/*.app/' --exclude 'xtool/ship-signing/' \
+  "$root/" "$host:$remote_root/" >&2
+
+ssh "$host" "test -e '$remote_root/$container_rel'" || {
+  echo "mac-sim-preview: $container_rel did not sync to $host" >&2
+  exit 1
+}
+
+python3 - "$root" "$remote_root" "$remote_file" "$container_rel" "$container_kind" "$scheme" "$udid" "$host" "$remote_home" "$remote_axe" <<'PY'
+import json, sys
+(root, remote_root, remote_file, container_rel, container_kind, scheme,
+ udid, host, remote_home, remote_axe) = sys.argv[1:]
+print(json.dumps({
+    "root": root,
+    "remote_root": remote_root,
+    "remote_file": remote_file,
+    "remote_container": remote_root + "/" + container_rel,
+    "container_rel": container_rel,
+    "container_kind": container_kind,
+    "scheme": scheme,
+    "udid": udid,
+    "host": host,
+    "remote_home": remote_home,
+    "remote_axe": remote_axe,
+    "remote_bin": remote_home + "/.local/bin",
+}))
+PY

@@ -1,0 +1,203 @@
+#!/usr/bin/env luajit
+-- mac-sim-view: Standalone native WebKitGTK window for iOS Simulator via LuaJIT FFI
+-- Part of tekibo/mac-sim.nvim
+
+local ffi = require("ffi")
+
+ffi.cdef[[
+  void gtk_init(int *argc, char ***argv);
+  void *gtk_window_new(int type);
+  void gtk_window_set_title(void *window, const char *title);
+  void gtk_window_set_default_size(void *window, int width, int height);
+  void gtk_window_set_position(void *window, int position);
+  void gtk_window_set_resizable(void *window, int resizable);
+  void gtk_container_add(void *container, void *widget);
+  void gtk_widget_show_all(void *widget);
+  void gtk_main(void);
+  void gtk_main_quit(void);
+
+  void g_set_prgname(const char *prgname);
+  void g_set_application_name(const char *application_name);
+
+  void *webkit_web_view_new(void);
+  void webkit_web_view_load_uri(void *web_view, const char *uri);
+  void *webkit_web_view_get_settings(void *web_view);
+  void webkit_settings_set_enable_developer_extras(void *settings, int enable);
+  void webkit_settings_set_enable_webgl(void *settings, int enable);
+
+  unsigned long g_signal_connect_data(void *instance, const char *detailed_signal, void (*c_handler)(void), void *data, void *destroy_data, int connect_flags);
+
+  int socket(int domain, int type, int protocol);
+  int connect(int sockfd, const void *addr, unsigned int addrlen);
+  int close(int fd);
+  int usleep(unsigned int usec);
+  int fork(void);
+  int setsid(void);
+  int getpid(void);
+  int open(const char *pathname, int flags, ...);
+  int dup2(int oldfd, int newfd);
+
+  struct in_addr { unsigned int s_addr; };
+  struct sockaddr_in {
+    short sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    char sin_zero[8];
+  };
+  unsigned short htons(unsigned short hostshort);
+  unsigned int inet_addr(const char *cp);
+]]
+
+-- Parse CLI options
+local foreground = false
+local clean_args = {}
+
+for i = 1, #arg do
+  if arg[i] == "-f" or arg[i] == "--foreground" then
+    foreground = true
+  elseif arg[i] == "-d" or arg[i] == "--detach" then
+    foreground = false
+  else
+    table.insert(clean_args, arg[i])
+  end
+end
+
+local port = tonumber(os.getenv("MAC_SIM_PORT")) or 3400
+local host = os.getenv("MACBOX_SSH_HOST") or "macbox"
+local url = clean_args[1] or string.format("http://127.0.0.1:%d", port)
+local width = tonumber(clean_args[2]) or 410
+local height = tonumber(clean_args[3]) or 840
+local title = clean_args[4] or "iOS Simulator"
+
+-- Auto-detach into background if not running in foreground mode
+if not foreground then
+  local pid = ffi.C.fork()
+  if pid > 0 then
+    io.stdout:write(string.format("==> mac-sim-view started in background (PID: %d)\n", tonumber(pid)))
+    os.exit(0)
+  elseif pid < 0 then
+    io.stderr:write("mac-sim-view: fork failed\n")
+    os.exit(1)
+  end
+  ffi.C.setsid()
+  local null_fd = ffi.C.open("/dev/null", 2)
+  if null_fd >= 0 then
+    ffi.C.dup2(null_fd, 0)
+    ffi.C.dup2(null_fd, 1)
+    ffi.C.dup2(null_fd, 2)
+    ffi.C.close(null_fd)
+  end
+end
+
+-- Record PID so editor / CLI can manage the window
+local runtime_base = os.getenv("XDG_RUNTIME_DIR") or (os.getenv("HOME") .. "/.cache")
+local runtime_dir = runtime_base .. "/mac-sim.nvim"
+os.execute("mkdir -p '" .. runtime_dir .. "'")
+local pid_file = runtime_dir .. "/view.pid"
+
+local pid_f = io.open(pid_file, "w")
+if pid_f then
+  pid_f:write(tostring(ffi.C.getpid()) .. "\n")
+  pid_f:close()
+end
+
+local gtk_ok, gtk = pcall(ffi.load, "libgtk-3.so.0")
+if not gtk_ok then
+  io.stderr:write("mac-sim-view: failed to load libgtk-3.so.0\n")
+  os.exit(1)
+end
+
+local glib_ok, glib = pcall(ffi.load, "libglib-2.0.so.0")
+
+local webkit_ok, webkit = pcall(ffi.load, "libwebkit2gtk-4.1.so.0")
+if not webkit_ok then
+  webkit_ok, webkit = pcall(ffi.load, "libwebkit2gtk-4.0.so.37")
+end
+if not webkit_ok then
+  io.stderr:write("mac-sim-view: failed to load libwebkit2gtk-4.1 or 4.0\n")
+  os.exit(1)
+end
+
+local gobject_ok, gobject = pcall(ffi.load, "libgobject-2.0.so.0")
+if not gobject_ok then
+  io.stderr:write("mac-sim-view: failed to load libgobject-2.0.so.0\n")
+  os.exit(1)
+end
+
+local function check_port(p)
+  local fd = ffi.C.socket(2, 1, 0)
+  if fd < 0 then return false end
+  local addr = ffi.new("struct sockaddr_in")
+  addr.sin_family = 2
+  addr.sin_port = ffi.C.htons(p)
+  addr.sin_addr.s_addr = ffi.C.inet_addr("127.0.0.1")
+  local res = ffi.C.connect(fd, addr, ffi.sizeof(addr))
+  ffi.C.close(fd)
+  return res == 0
+end
+
+local function ensure_env(h, p)
+  h = h or "macbox"
+  p = p or 3400
+
+  -- 1. Forward port if not open locally
+  if not check_port(p) then
+    os.execute(string.format("ssh -f -N -L %d:127.0.0.1:%d -o ExitOnForwardFailure=yes %s 2>/dev/null", p, p, h))
+    for _ = 1, 15 do
+      if check_port(p) then break end
+      ffi.C.usleep(100000)
+    end
+  end
+
+  -- 2. Check if hub responds on guest; if not, launch it
+  local test_cmd = string.format("curl -s -m 1 -o /dev/null http://127.0.0.1:%d/api/devices 2>/dev/null", p)
+  if os.execute(test_cmd) ~= 0 then
+    local remote_cmd = string.format(
+      "HUB=$(ls -dt ~/.t3/device/tools/expo-device-hub@*/node_modules/expo-device-hub/dist/server/cli.mjs 2>/dev/null | head -1); " ..
+      "[ -n \"$HUB\" ] && nohup node \"$HUB\" --port %d --platform ios > ~/.t3/hub.log 2>&1 &",
+      p
+    )
+    os.execute(string.format("ssh %s %q 2>/dev/null", h, remote_cmd))
+    for _ = 1, 30 do
+      if os.execute(test_cmd) == 0 then break end
+      ffi.C.usleep(100000)
+    end
+  end
+end
+
+-- Auto-ensure tunnel & hub if connecting to localhost/127.0.0.1
+if url:find("127%.0%.0%.1") or url:find("localhost") then
+  ensure_env(host, port)
+end
+
+if glib_ok then
+  glib.g_set_prgname("mac-sim-view")
+  glib.g_set_application_name("iOS Simulator")
+end
+
+gtk.gtk_init(nil, nil)
+
+local win = gtk.gtk_window_new(0)
+gtk.gtk_window_set_title(win, title)
+gtk.gtk_window_set_default_size(win, width, height)
+gtk.gtk_window_set_resizable(win, 1)
+gtk.gtk_window_set_position(win, 1) -- GTK_WIN_POS_CENTER: opens cleanly centered
+
+local view = webkit.webkit_web_view_new()
+local settings = webkit.webkit_web_view_get_settings(view)
+if settings ~= nil then
+  webkit.webkit_settings_set_enable_developer_extras(settings, 1)
+  webkit.webkit_settings_set_enable_webgl(settings, 1)
+end
+
+webkit.webkit_web_view_load_uri(view, url)
+gtk.gtk_container_add(win, view)
+
+local destroy_cb = ffi.cast("void (*)(void)", function()
+  pcall(os.remove, pid_file)
+  gtk.gtk_main_quit()
+end)
+gobject.g_signal_connect_data(win, "destroy", destroy_cb, nil, nil, 0)
+
+gtk.gtk_widget_show_all(win)
+gtk.gtk_main()
